@@ -1,19 +1,10 @@
-# Virtual Environment
 venv/
-
-# Environment Variables
+.venv/
 .env
-
-# Python Cache
 __pycache__/
-*.pyc
-
-# VS Code
+*.py[cod]
+.pytest_cache/
 .vscode/
-
-# JetBrains IDEs
 .idea/
-
-# OS Files
 .DS_Store
 Thumbs.db

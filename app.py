@@ -1,247 +1,153 @@
 import os
-import asyncio
+import logging
 import streamlit as st
 from dotenv import load_dotenv
-
+from sqlalchemy import URL
 from langchain_community.utilities import SQLDatabase
-from langchain_google_genai import ChatGoogleGenerativeAI
 from langchain_community.agent_toolkits import create_sql_agent
-
-# ---------------- Load Environment Variables ---------------- #
+from langchain_google_genai import ChatGoogleGenerativeAI
 
 load_dotenv()
-
-GOOGLE_API_KEY = os.getenv("GOOGLE_API_KEY")
-
-if GOOGLE_API_KEY:
-    os.environ["GOOGLE_API_KEY"] = GOOGLE_API_KEY
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+MODEL = os.getenv("GEMINI_MODEL", "gemini-3.8-flash")
 
 
-# ---------------- Gemini + SQL Agent ---------------- #
+def connect_read_only_db(host, port, username, password, database):
+    """Connect to PostgreSQL with read-only transactions as defense in depth."""
+    uri = URL.create(
+        "postgresql+psycopg2", username=username, password=password,
+        host=host, port=int(port), database=database
+    )
+    return SQLDatabase.from_uri(
+        uri,
+        engine_args={
+            "pool_pre_ping": True,
+            "connect_args": {
+                "options": "-c default_transaction_read_only=on",
+                "connect_timeout": 8,
+            },
+        },
+        sample_rows_in_table_info=2,
+    )
 
-async def get_answer_by_sql_query(db, user_input):
 
+def answer_question(db, question):
+    api_key = os.getenv("GOOGLE_API_KEY")
+    if not api_key:
+        raise RuntimeError("GOOGLE_API_KEY is not configured.")
     llm = ChatGoogleGenerativeAI(
-        model="gemini-1.5-pro-latest",
-        temperature=0
+        model=MODEL, temperature=0, google_api_key=api_key,
+        max_retries=2, timeout=45
     )
 
-    agent_executor = create_sql_agent(
-        llm,
-        db=db,
-        verbose=True
+
+    agent = create_sql_agent(
+        llm=llm, db=db, agent_type="zero-shot-react-description", verbose=False,
+        max_iterations=10, max_execution_time=90,
+        agent_executor_kwargs={"handle_parsing_errors": True},
     )
 
-    response = agent_executor.invoke(
-        {"input": user_input}
-    )
+    result = agent.invoke({"input": question})
+    return result.get("output", "I couldn't produce an answer.")
 
-    return response
-
-
-# ---------------- Main App ---------------- #
 
 def main():
-
-    st.set_page_config(
-        page_title="AI Business Intelligence Assistant",
-        page_icon="📊",
-        layout="wide"
-    )
-
+    st.set_page_config(page_title="AI Business Intelligence Assistant",
+                       page_icon="📊", layout="wide")
     st.title("📊 AI Business Intelligence Assistant")
+    st.caption("Explore PostgreSQL business data using natural-language questions.")
+    st.markdown("**Tech stack:** Python · Streamlit · PostgreSQL · SQLAlchemy · LangChain · Google Gemini")
 
-    st.markdown(
-        "**Tech Stack:** Python | Streamlit | PostgreSQL | LangChain | Google Gemini | SQL"
-    )
-
-    # ---------------- KPI Cards ---------------- #
-
-    col1, col2, col3, col4 = st.columns(4)
-
-    with col1:
-        st.metric("💰 Revenue", "$125,400", "+8.2%")
-
-    with col2:
-        st.metric("🛒 Orders", "2,145", "+5.4%")
-
-    with col3:
-        st.metric("👥 Customers", "842", "+3.1%")
-
-    with col4:
-        st.metric("📈 Profit", "$38,600", "+9.7%")
-
-    st.markdown(
-        "Analyze business databases using natural language powered by **Google Gemini**, **LangChain**, and **PostgreSQL**."
-    )
-
-    st.info("""
-### 💡 Example Business Questions
-
-• Show monthly revenue
-
-• Top 10 customers
-
-• Which category generated highest sales?
-
-• Which products are underperforming?
-
-• Show region-wise sales
-
-• Compare sales between Q1 and Q2
-""")
-
-    # ---------------- Session State ---------------- #
-
-    if "activate_chat" not in st.session_state:
-        st.session_state.activate_chat = False
-
+    if "db" not in st.session_state:
+        st.session_state.db = None
     if "messages" not in st.session_state:
         st.session_state.messages = []
 
-    # ---------------- Display Chat History ---------------- #
-
-    for message in st.session_state.messages:
-
-        with st.chat_message(
-            message["role"],
-            avatar=message["avatar"]
-        ):
-            st.markdown(message["content"])
-
-    # ---------------- Sidebar ---------------- #
-
     with st.sidebar:
-
-        st.header("🗄️ Database Connection")
-
-        username = st.text_input("Username")
-
-        password = st.text_input(
-            "Password",
-            type="password"
-        )
-
-        hostname = st.text_input(
-            "Host",
-            value="localhost"
-        )
-
-        port = st.text_input(
-            "Port",
-            value="5432"
-        )
-
-        db_name = st.text_input("Database Name")
-
-        if st.button("Connect Database"):
-
-            if not GOOGLE_API_KEY:
-                st.error("GOOGLE_API_KEY not found in .env file.")
-
-            elif not all([username, password, hostname, port, db_name]):
-                st.warning("Please fill all database details.")
-
+        st.header("🗄️ Database connection")
+        st.caption("Use a dedicated PostgreSQL user with SELECT-only privileges.")
+        with st.form("connect_form"):
+            host = st.text_input("Host", value=os.getenv("DB_HOST", "localhost"))
+            port = st.text_input("Port", value=os.getenv("DB_PORT", "5432"))
+            database = st.text_input("Database name", value=os.getenv("DB_NAME", ""))
+            username = st.text_input("Read-only username", value=os.getenv("DB_USER", ""))
+            password = st.text_input("Password", type="password")
+            submitted = st.form_submit_button("Connect database", type="primary")
+            
+        if submitted:
+            if not os.getenv("GOOGLE_API_KEY"):
+                st.error("Set GOOGLE_API_KEY in your .env file or deployment secrets.")
+            elif not all([host.strip(), port.strip(), database.strip(), username.strip(), password]):
+                st.warning("Please fill in every database field.")
             else:
-
-                postgres_uri = (
-                    f"postgresql+psycopg2://"
-                    f"{username}:{password}@"
-                    f"{hostname}:{port}/{db_name}"
-                )
-
                 try:
-
-                    db = SQLDatabase.from_uri(postgres_uri)
-
+                    db = connect_read_only_db(host.strip(), port.strip(), username.strip(),
+                                              password, database.strip())
+                    tables = db.get_usable_table_names()
                     st.session_state.db = db
-                    st.session_state.activate_chat = True
-
-                    st.success("✅ Database Connected Successfully!")
-
-                    with st.expander("Connection Details"):
-                        st.code(postgres_uri)
+                    st.session_state.messages = []
+                    st.success(f"Connected. Found {len(tables)} usable table(s).")
 
                 except Exception as e:
+                    logger.exception("Database connection failed")
+                    st.error(f"Connection failed: {e}")
 
-                    st.error(f"❌ Database Connection Failed\n\n{e}")
+        if st.session_state.db is not None and st.button("Disconnect database"):
+            st.session_state.db = None
+            st.session_state.messages = []
+            st.rerun()
 
-    # ---------------- Chat Section ---------------- #
+    if st.session_state.db is None:
+        st.info("Connect a PostgreSQL database from the sidebar to begin.")
+        st.markdown("### Example questions")
+        st.markdown("- Show monthly revenue\n- List the top 10 customers by sales\n- Compare orders by region\n- Which products have the highest sales?")
+        return
 
-    if st.session_state.activate_chat:
+    with st.expander("Available database schema"):
+        try:
+            tables = st.session_state.db.get_usable_table_names()
+            st.write(", ".join(tables) if tables else "No usable tables found.")
+            for table in tables:
+                with st.expander(f"Table: {table}"):
+                    st.code(st.session_state.db.get_table_info([table]), language="sql")
+        except Exception:
+            logger.exception("Schema retrieval failed")
+            st.warning("Schema information is currently unavailable.")
 
-        prompt = st.chat_input(
-            "Ask a business question (e.g., Show monthly revenue)"
-        )
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
 
-        if prompt:
+    question = st.chat_input("Ask a business question about your data…")
+    if question:
+        st.session_state.messages.append({"role": "user", "content": question})
+        with st.chat_message("user"):
+            st.markdown(question)
+        with st.chat_message("assistant"):
+            with st.spinner("Analyzing your question…"):
+                try:
+                    answer = answer_question(st.session_state.db, question)
+                    st.markdown(answer)
+                    st.download_button("Download insight", data=answer,
+                                       file_name="business_insight.txt",
+                                       mime="text/plain")
+                    st.session_state.messages.append({"role": "assistant", "content": answer})
 
-            with st.chat_message("user", avatar="👤"):
-                st.markdown(prompt)
 
-            st.session_state.messages.append(
-                {
-                    "role": "user",
-                    "avatar": "👤",
-                    "content": prompt
-                }
-            )
+                except Exception as e:
+                    logger.exception("Analysis failed")
+                    error_text = str(e)
 
-            try:
-
-                with st.spinner("🤖 Analyzing database..."):
-
-                    response = asyncio.run(
-                        get_answer_by_sql_query(
-                            st.session_state.db,
-                            prompt
+                    if "RESOURCE_EXHAUSTED" in error_text or "429" in error_text:
+                        st.error(
+                            "Gemini API quota exceeded. Please wait for the quota "
+                            "to reset or check your Google AI Studio usage and billing."
                         )
-                    )
-
-                cleaned_response = response["output"]
-
-                with st.chat_message("assistant", avatar="📊"):
-
-                    st.subheader("AI Business Insight")
-
-                    st.success("Analysis Complete!")
-
-                    st.markdown(cleaned_response)
-
-                    st.download_button(
-                        label="📥 Download Business Insight",
-                        data=cleaned_response,
-                        file_name="business_insight.txt",
-                        mime="text/plain"
-                    )
-
-                st.session_state.messages.append(
-                    {
-                        "role": "assistant",
-                        "avatar": "📊",
-                        "content": cleaned_response
-                    }
-                )
-
-            except Exception as e:
-
-                st.error(f"❌ {e}")
-
-    else:
-
-        st.warning("👈 Connect your PostgreSQL database to begin.")
-
-    # ---------------- Footer ---------------- #
-
-    st.divider()
-
-    st.caption(
-        "Built with ❤️ using Streamlit • LangChain • Google Gemini • PostgreSQL"
-    )
-
-    st.caption(
-        "AI-generated insights depend on the connected database."
-    )
+                    elif "API_KEY_INVALID" in error_text or "API key not valid" in error_text:
+                        st.error("Gemini API key is invalid. Check your local .env configuration.")
+                    else:
+                        st.error(f"Analysis failed: {error_text}")
 
 
 if __name__ == "__main__":
